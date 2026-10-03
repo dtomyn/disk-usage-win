@@ -28,19 +28,26 @@ Double-click `disk-usage-win.exe`, or run `run.cmd`.
 
 Choose a folder and click **Scan**. While scanning, the status bar displays an
 animated progress indicator and live directory, file, byte, and error counts.
-The UI remains responsive, and scanning can be canceled.
+The folder tree, folder list, and treemap populate during the scan, with updates
+roughly every half second. You can browse discovered folders and use **Up**
+while scanning. Sizes and percentages reflect only data discovered so far;
+unfinished folders are marked **partial** until their scan finishes.
+The UI remains responsive, and scanning can be canceled. Cancellation keeps
+the partial results visible. Finishing a scan preserves the folder you are viewing.
 
 ## Features and performance
 
 - Uses native Win32 `FindFirstFileEx` / `FindNextFile` enumeration.
 - Uses `FIND_FIRST_EX_LARGE_FETCH` where supported.
 - Runs scans on a background thread to keep the GUI responsive.
-- Stores one in-memory object per directory; individual files are not retained.
+- Stores directory-level scan data and a separate UI-owned directory model
+  while scanning; individual files are not retained. Updates are coalesced
+  so a busy UI does not accumulate a queue of redraws.
 - Skips reparse points and junctions to avoid loops and unexpected traversal.
 - Materializes TreeView children lazily.
 - Performs no content hashing, thumbnail generation, or per-file visualization.
-- Renders the treemap from completed directory totals, without additional disk
-  I/O.
+- Renders the treemap from discovered directory totals, including provisional
+  sizes during a scan, without additional disk I/O.
 - Shows a clickable **Errors: N** status item. Selecting it opens a non-modal
   error details window with the Windows error code, operation, message, and
   path. The window offers **Refresh**, **Copy All**, and **Save Log** controls.
@@ -67,6 +74,14 @@ The UI remains responsive, and scanning can be canceled.
 - No raw-disk or NTFS MFT access.
 - The source is a single `Program.cs` file and can be reviewed before
   compilation.
+
+## Tests
+
+Run `test.cmd` to compile and run the dependency-free scanner and WinForms
+regression tests. Tests cover live results before completion, final totals,
+snapshot isolation, coalesced updates, navigation, selection preservation,
+cancellation, and empty/inaccessible folders. Temporary fixtures and the test
+executable are removed afterward.
 
 ## Version notes
 

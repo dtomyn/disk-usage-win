@@ -44,7 +44,40 @@ namespace FastDiskUsage
         internal long TotalFolders;
         internal int ErrorCode;
         internal bool IsReparsePoint;
+        internal bool IsComplete;
         internal readonly List<DirectoryNode> Children = new List<DirectoryNode>();
+    }
+
+    internal sealed class DirectoryUpdate
+    {
+        internal DirectoryNode Source;
+        internal DirectoryNode Parent;
+        internal string Name;
+        internal string FullPath;
+        internal long DirectBytes;
+        internal long DirectFiles;
+        internal long TotalBytes;
+        internal long TotalFiles;
+        internal long TotalFolders;
+        internal int ErrorCode;
+        internal bool IsReparsePoint;
+        internal bool IsComplete;
+
+        internal DirectoryUpdate(DirectoryNode node)
+        {
+            Source = node;
+            Parent = node.Parent;
+            Name = node.Name;
+            FullPath = node.FullPath;
+            DirectBytes = node.DirectBytes;
+            DirectFiles = node.DirectFiles;
+            TotalBytes = node.TotalBytes;
+            TotalFiles = node.TotalFiles;
+            TotalFolders = node.TotalFolders;
+            ErrorCode = node.ErrorCode;
+            IsReparsePoint = node.IsReparsePoint;
+            IsComplete = node.IsComplete;
+        }
     }
 
     internal sealed class ScanProgress
@@ -54,6 +87,7 @@ namespace FastDiskUsage
         internal long Files;
         internal long Bytes;
         internal long Errors;
+        internal List<DirectoryUpdate> Updates;
     }
 
     internal sealed class ScanError
@@ -219,6 +253,8 @@ namespace FastDiskUsage
 
             Stack<ScanFrame> stack = new Stack<ScanFrame>(64);
             stack.Push(new ScanFrame(root));
+            HashSet<DirectoryNode> changed = new HashSet<DirectoryNode>();
+            changed.Add(root);
 
             long dirs = 0;
             long files = 0;
@@ -272,8 +308,8 @@ namespace FastDiskUsage
                         errors++;
                         ReportError(errorHandler, frame.Node.FullPath, "Open directory", finalError);
                         stack.Pop();
-                        FinalizeNode(frame.Node);
-                        ReportMaybe(progress, reportWatch, ref entriesSinceReport, frame.Node.FullPath, dirs, files, bytes, errors, true);
+                        FinalizeNode(frame.Node, changed);
+                        ReportMaybe(progress, reportWatch, ref entriesSinceReport, frame.Node.FullPath, dirs, files, bytes, errors, false, stack, changed);
                         continue;
                     }
 
@@ -290,8 +326,8 @@ namespace FastDiskUsage
                         frame.Handle = NativeMethods.INVALID_HANDLE_VALUE;
                     }
                     stack.Pop();
-                    FinalizeNode(frame.Node);
-                    ReportMaybe(progress, reportWatch, ref entriesSinceReport, frame.Node.FullPath, dirs, files, bytes, errors, false);
+                    FinalizeNode(frame.Node, changed);
+                    ReportMaybe(progress, reportWatch, ref entriesSinceReport, frame.Node.FullPath, dirs, files, bytes, errors, false, stack, changed);
                     continue;
                 }
 
@@ -309,6 +345,7 @@ namespace FastDiskUsage
                     if (err != NativeMethods.ERROR_NO_MORE_FILES)
                     {
                         frame.Node.ErrorCode = err;
+                        changed.Add(frame.Node);
                         errors++;
                         ReportError(errorHandler, frame.Node.FullPath, "Enumerate directory", err);
                     }
@@ -329,7 +366,12 @@ namespace FastDiskUsage
                     child.FullPath = CombinePath(frame.Node.FullPath, name);
                     child.Parent = frame.Node;
                     child.IsReparsePoint = isReparse;
+                    child.IsComplete = isReparse;
                     frame.Node.Children.Add(child);
+                    if (!isReparse)
+                        frame.Node.TotalFolders++;
+                    changed.Add(child);
+                    changed.Add(frame.Node);
 
                     if (!isReparse)
                     {
@@ -341,12 +383,20 @@ namespace FastDiskUsage
                     long size = ((long)current.nFileSizeHigh << 32) | current.nFileSizeLow;
                     frame.Node.DirectBytes += size;
                     frame.Node.DirectFiles++;
+                    frame.Node.TotalBytes += size;
+                    frame.Node.TotalFiles++;
+                    changed.Add(frame.Node);
                     files++;
                     bytes += size;
                 }
 
-                    ReportMaybe(progress, reportWatch, ref entriesSinceReport, frame.Node.FullPath, dirs, files, bytes, errors, false);
+                    ReportMaybe(progress, reportWatch, ref entriesSinceReport, frame.Node.FullPath, dirs, files, bytes, errors, false, stack, changed);
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                ReportMaybe(progress, reportWatch, ref entriesSinceReport, root.FullPath, dirs, files, bytes, errors, true, stack, changed);
+                throw;
             }
             finally
             {
@@ -361,39 +411,22 @@ namespace FastDiskUsage
                 }
             }
 
-            if (progress != null)
-            {
-                ScanProgress p = new ScanProgress();
-                p.CurrentPath = root.FullPath;
-                p.Directories = dirs;
-                p.Files = files;
-                p.Bytes = bytes;
-                p.Errors = errors;
-                progress(p);
-            }
+            changed.Add(root);
+            ReportMaybe(progress, reportWatch, ref entriesSinceReport, root.FullPath, dirs, files, bytes, errors, true, stack, changed);
             return root;
         }
 
-        private static void FinalizeNode(DirectoryNode node)
+        private static void FinalizeNode(DirectoryNode node, HashSet<DirectoryNode> changed)
         {
-            long totalBytes = node.DirectBytes;
-            long totalFiles = node.DirectFiles;
-            long totalFolders = 0;
-
-            for (int i = 0; i < node.Children.Count; i++)
+            node.IsComplete = true;
+            changed.Add(node);
+            if (node.Parent != null)
             {
-                DirectoryNode child = node.Children[i];
-                if (!child.IsReparsePoint)
-                {
-                    totalBytes += child.TotalBytes;
-                    totalFiles += child.TotalFiles;
-                    totalFolders += 1 + child.TotalFolders;
-                }
+                node.Parent.TotalBytes += node.TotalBytes;
+                node.Parent.TotalFiles += node.TotalFiles;
+                node.Parent.TotalFolders += node.TotalFolders;
+                changed.Add(node.Parent);
             }
-
-            node.TotalBytes = totalBytes;
-            node.TotalFiles = totalFiles;
-            node.TotalFolders = totalFolders;
         }
 
         private static void ReportError(Action<string, string, int> errorHandler, string path, string operation, int code)
@@ -403,11 +436,11 @@ namespace FastDiskUsage
         }
 
         private static void ReportMaybe(Action<ScanProgress> progress, Stopwatch watch, ref long entries, string path,
-            long dirs, long files, long bytes, long errors, bool force)
+            long dirs, long files, long bytes, long errors, bool force, Stack<ScanFrame> stack, HashSet<DirectoryNode> changed)
         {
             if (progress == null)
                 return;
-            if (!force && entries < 2048 && watch.ElapsedMilliseconds < 150)
+            if (!force && watch.ElapsedMilliseconds < 500)
                 return;
 
             entries = 0;
@@ -418,6 +451,27 @@ namespace FastDiskUsage
             p.Files = files;
             p.Bytes = bytes;
             p.Errors = errors;
+            Dictionary<DirectoryNode, DirectoryUpdate> updates = new Dictionary<DirectoryNode, DirectoryUpdate>();
+            foreach (DirectoryNode node in changed)
+                updates[node] = new DirectoryUpdate(node);
+
+            // Active ancestors do not own their unfinished child's totals yet.
+            long activeBytes = 0;
+            long activeFiles = 0;
+            long activeFolders = 0;
+            foreach (ScanFrame frame in stack)
+            {
+                DirectoryUpdate update = new DirectoryUpdate(frame.Node);
+                update.TotalBytes += activeBytes;
+                update.TotalFiles += activeFiles;
+                update.TotalFolders += activeFolders;
+                activeBytes = update.TotalBytes;
+                activeFiles = update.TotalFiles;
+                activeFolders = update.TotalFolders;
+                updates[frame.Node] = update;
+            }
+            p.Updates = new List<DirectoryUpdate>(updates.Values);
+            changed.Clear();
             progress(p);
         }
 
@@ -674,8 +728,6 @@ namespace FastDiskUsage
             get { return _root; }
             set
             {
-                if (Object.ReferenceEquals(_root, value))
-                    return;
                 _root = value;
                 _hoverCell = null;
                 _contextNode = null;
@@ -701,7 +753,7 @@ namespace FastDiskUsage
 
             if (_root == null)
             {
-                TextRenderer.DrawText(e.Graphics, "Treemap appears after a scan completes.", Font,
+                TextRenderer.DrawText(e.Graphics, "Treemap appears as scan results arrive.", Font,
                     area, SystemColors.GrayText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 return;
             }
@@ -982,6 +1034,12 @@ namespace FastDiskUsage
         private Stopwatch _scanWatch;
         private ErrorDetailsForm _errorDetailsForm;
         private DirectoryNode _contextFolder;
+        private readonly object _progressSync = new object();
+        private readonly Dictionary<DirectoryNode, DirectoryUpdate> _pendingUpdates = new Dictionary<DirectoryNode, DirectoryUpdate>();
+        private readonly Dictionary<DirectoryNode, DirectoryNode> _displayNodes = new Dictionary<DirectoryNode, DirectoryNode>();
+        private readonly System.Windows.Forms.Timer _resultsTimer = new System.Windows.Forms.Timer();
+        private ScanProgress _pendingProgress;
+        private bool _resultsDirty;
 
         internal MainForm()
         {
@@ -1135,6 +1193,8 @@ namespace FastDiskUsage
             Controls.Add(top);
             Controls.Add(_statusStrip);
             AcceptButton = _scanButton;
+            _resultsTimer.Interval = 500;
+            _resultsTimer.Tick += delegate { RefreshScanResults(); };
 
             Shown += delegate
             {
@@ -1210,6 +1270,13 @@ namespace FastDiskUsage
             _tree.Nodes.Clear();
             _list.Items.Clear();
             _treemap.Root = null;
+            _displayNodes.Clear();
+            lock (_progressSync)
+            {
+                _pendingUpdates.Clear();
+                _pendingProgress = null;
+            }
+            _resultsDirty = false;
             _scanWatch = Stopwatch.StartNew();
             _errorStore.Clear();
             UpdateErrorStatus(0);
@@ -1218,6 +1285,7 @@ namespace FastDiskUsage
             SetScanningUi(true);
             _status.Text = "Scanning " + path;
             _stats.Text = String.Empty;
+            _resultsTimer.Start();
 
             string scanPath = path;
             _scanThread = new Thread(delegate()
@@ -1250,27 +1318,120 @@ namespace FastDiskUsage
 
         private void ReportProgressFromWorker(ScanProgress p)
         {
-            if (IsDisposed || !IsHandleCreated)
-                return;
-            try
+            lock (_progressSync)
             {
-                BeginInvoke((MethodInvoker)delegate
+                _pendingProgress = p;
+                for (int i = 0; i < p.Updates.Count; i++)
+                    _pendingUpdates[p.Updates[i].Source] = p.Updates[i];
+            }
+        }
+
+        private void RefreshScanResults(bool force = false)
+        {
+            ScanProgress progress;
+            List<DirectoryUpdate> updates;
+            lock (_progressSync)
+            {
+                progress = _pendingProgress;
+                _pendingProgress = null;
+                updates = new List<DirectoryUpdate>(_pendingUpdates.Values);
+                _pendingUpdates.Clear();
+            }
+
+            for (int i = 0; i < updates.Count; i++)
+            {
+                DirectoryUpdate update = updates[i];
+                if (!_displayNodes.ContainsKey(update.Source))
+                    _displayNodes.Add(update.Source, new DirectoryNode());
+            }
+            for (int i = 0; i < updates.Count; i++)
+            {
+                DirectoryUpdate update = updates[i];
+                DirectoryNode node = _displayNodes[update.Source];
+                node.Name = update.Name;
+                node.FullPath = update.FullPath;
+                node.DirectBytes = update.DirectBytes;
+                node.DirectFiles = update.DirectFiles;
+                node.TotalBytes = update.TotalBytes;
+                node.TotalFiles = update.TotalFiles;
+                node.TotalFolders = update.TotalFolders;
+                node.ErrorCode = update.ErrorCode;
+                node.IsReparsePoint = update.IsReparsePoint;
+                node.IsComplete = update.IsComplete;
+                if (update.Parent == null)
+                    _root = node;
+                else if (node.Parent == null)
                 {
-                    if (!_progress.Visible)
-                        return;
-                    _status.Text = CompactPath(p.CurrentPath, 95);
-                    _stats.Text = String.Format("{0:N0} dirs   {1:N0} files   {2}",
-                        p.Directories, p.Files, FormatBytes(p.Bytes));
-                    UpdateErrorStatus(p.Errors);
-                });
+                    node.Parent = _displayNodes[update.Parent];
+                    node.Parent.Children.Add(node);
+                }
             }
-            catch (InvalidOperationException)
+
+            _resultsDirty |= updates.Count != 0;
+            if (_resultsDirty && (force || !_folderMenu.Visible) && _root != null)
             {
+                _tree.BeginUpdate();
+                try
+                {
+                    if (_tree.Nodes.Count == 0)
+                    {
+                        TreeNode rootNode = MakeTreeNode(_root);
+                        _tree.Nodes.Add(rootNode);
+                        _tree.SelectedNode = rootNode;
+                        rootNode.Expand();
+                    }
+                    RefreshTreeNode(_tree.Nodes[0]);
+                }
+                finally
+                {
+                    _tree.EndUpdate();
+                }
+                ShowDirectory(_current ?? _root);
+                _resultsDirty = false;
             }
+            if (progress != null)
+            {
+                _status.Text = _cancelRequested ? "Cancelling..." : "Scanning (partial): " + CompactPath(progress.CurrentPath, 75);
+                _stats.Text = String.Format("{0:N0} dirs   {1:N0} files   {2}",
+                    progress.Directories, progress.Files, FormatBytes(progress.Bytes));
+                UpdateErrorStatus(progress.Errors);
+            }
+        }
+
+        private void RefreshTreeNode(TreeNode treeNode)
+        {
+            DirectoryNode node = (DirectoryNode)treeNode.Tag;
+            treeNode.Text = TreeNodeText(node);
+            bool placeholder = treeNode.Nodes.Count == 1 && treeNode.Nodes[0].Tag == null;
+            if (placeholder && !treeNode.IsExpanded)
+                return;
+            if (treeNode.IsExpanded || (treeNode.Nodes.Count != 0 && !placeholder))
+            {
+                if (placeholder)
+                    treeNode.Nodes.Clear();
+                HashSet<DirectoryNode> existing = new HashSet<DirectoryNode>();
+                foreach (TreeNode child in treeNode.Nodes)
+                    existing.Add((DirectoryNode)child.Tag);
+                List<DirectoryNode> children = new List<DirectoryNode>(node.Children);
+                children.Sort(CompareNodesBySize);
+                foreach (DirectoryNode child in children)
+                    if (!existing.Contains(child))
+                        treeNode.Nodes.Add(MakeTreeNode(child));
+            }
+            else if (treeNode.Nodes.Count == 0 && node.Children.Count != 0)
+            {
+                treeNode.Nodes.Add(new TreeNode("..."));
+                return;
+            }
+            foreach (TreeNode child in treeNode.Nodes)
+                RefreshTreeNode(child);
         }
 
         private void ScanCompleted(DirectoryNode result, string error)
         {
+            RefreshScanResults(true);
+            _resultsTimer.Stop();
+            _displayNodes.Clear();
             if (_scanWatch != null)
                 _scanWatch.Stop();
             _scanThread = null;
@@ -1280,23 +1441,18 @@ namespace FastDiskUsage
 
             if (result == null)
             {
-                _status.Text = error == "Cancelled" ? "Cancelled" : "Scan failed: " + error;
-                _stats.Text = String.Empty;
+                if (_current != null)
+                    ShowDirectory(_current);
+                _status.Text = (error == "Cancelled" ? "Cancelled - partial results" : "Scan failed: " + error);
                 return;
             }
 
-            _root = result;
-            _current = result;
-            TreeNode rootNode = MakeTreeNode(result);
-            _tree.Nodes.Add(rootNode);
-            _tree.SelectedNode = rootNode;
-            rootNode.Expand();
-            ShowDirectory(result);
+            ShowDirectory(_current ?? _root);
 
             string elapsed = _scanWatch == null ? "" : FormatElapsed(_scanWatch.Elapsed);
             _status.Text = "Complete: " + result.FullPath;
             _stats.Text = String.Format("{0}   {1:N0} files   {2:N0} folders   {3}",
-                FormatBytes(result.TotalBytes), result.TotalFiles, result.TotalFolders, elapsed);
+                FormatBytes(_root.TotalBytes), _root.TotalFiles, _root.TotalFolders, elapsed);
         }
 
         private void UpdateErrorStatus(long count)
@@ -1331,18 +1487,22 @@ namespace FastDiskUsage
             _scanButton.Enabled = !scanning;
             _pathBox.Enabled = !scanning;
             _cancelButton.Enabled = scanning;
-            _upButton.Enabled = !scanning && _current != null && _current != _root;
+            _upButton.Enabled = _current != null && _current != _root;
             _progress.Visible = scanning;
         }
 
         private TreeNode MakeTreeNode(DirectoryNode node)
         {
-            string text = node.Name + "  [" + FormatBytes(node.TotalBytes) + "]";
-            TreeNode tn = new TreeNode(text);
+            TreeNode tn = new TreeNode(TreeNodeText(node));
             tn.Tag = node;
             if (node.Children.Count != 0)
                 tn.Nodes.Add(new TreeNode("..."));
             return tn;
+        }
+
+        private static string TreeNodeText(DirectoryNode node)
+        {
+            return node.Name + "  [" + FormatBytes(node.TotalBytes) + (node.IsComplete ? "" : ", partial") + "]";
         }
 
         private void TreeBeforeExpand(object sender, TreeViewCancelEventArgs e)
@@ -1523,11 +1683,15 @@ namespace FastDiskUsage
 
         private void ShowDirectory(DirectoryNode node)
         {
+            bool sameDirectory = Object.ReferenceEquals(_current, node);
             _current = node;
-            _upButton.Enabled = _root != null && node != _root && !(_scanThread != null && _scanThread.IsAlive);
+            _upButton.Enabled = _root != null && node != _root;
 
             List<DirectoryNode> children = new List<DirectoryNode>(node.Children);
             children.Sort(CompareNodesBySize);
+            DirectoryNode selected = !sameDirectory || _list.SelectedItems.Count == 0 ? null : _list.SelectedItems[0].Tag as DirectoryNode;
+            bool selectedDirectFiles = sameDirectory && _list.SelectedItems.Count != 0 && _list.SelectedItems[0].Tag == null;
+            DirectoryNode top = !sameDirectory || _list.TopItem == null ? null : _list.TopItem.Tag as DirectoryNode;
 
             _list.BeginUpdate();
             try
@@ -1536,13 +1700,20 @@ namespace FastDiskUsage
                 for (int i = 0; i < children.Count; i++)
                 {
                     DirectoryNode child = children[i];
-                    string status = child.IsReparsePoint ? "reparse skipped" : (child.ErrorCode != 0 ? "partial / denied" : "");
+                    string status = child.IsReparsePoint ? "reparse skipped" : (child.ErrorCode != 0 ? "partial / denied" : (child.IsComplete ? "" : "scanning / partial"));
                     AddListRow(child.Name, child.TotalBytes, node.TotalBytes, child.TotalFiles, child.TotalFolders, status, child);
                 }
 
                 if (node.DirectFiles != 0 || node.DirectBytes != 0)
                 {
-                    AddListRow("[files directly in this folder]", node.DirectBytes, node.TotalBytes, node.DirectFiles, 0, "", null);
+                    AddListRow("[files directly in this folder]", node.DirectBytes, node.TotalBytes, node.DirectFiles, 0, node.IsComplete ? "" : "scanning / partial", null);
+                }
+                foreach (ListViewItem item in _list.Items)
+                {
+                    if ((selected != null && Object.ReferenceEquals(item.Tag, selected)) || (selectedDirectFiles && item.Tag == null))
+                        item.Selected = true;
+                    if (top != null && Object.ReferenceEquals(item.Tag, top))
+                        _list.TopItem = item;
                 }
             }
             finally
@@ -1551,7 +1722,7 @@ namespace FastDiskUsage
             }
 
             _treemap.Root = node;
-            _status.Text = node.FullPath;
+            _status.Text = node.FullPath + (node.IsComplete ? "" : " (partial results)");
             _stats.Text = String.Format("{0}   {1:N0} files   {2:N0} folders", FormatBytes(node.TotalBytes), node.TotalFiles, node.TotalFolders);
         }
 
@@ -1612,6 +1783,13 @@ namespace FastDiskUsage
         {
             _cancelRequested = true;
             base.OnFormClosing(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _resultsTimer.Dispose();
+            base.Dispose(disposing);
         }
     }
 }
