@@ -1,0 +1,5 @@
+# Every file requires review from the repo owner.
+* @dtomyn
+
+# Ownership of this file and CI config is also locked to the owner.
+/.github/ @dtomyn
